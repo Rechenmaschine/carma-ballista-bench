@@ -15,16 +15,19 @@ Run on the control node of a fresh cluster:
 git clone https://github.com/Rechenmaschine/carma-ballista-bench.git
 cd carma-ballista-bench
 
-scripts/setup-node.sh    # /storage dirs + build deps
-scripts/build.sh         # build Ballista images + ballista-cli, load on workers
-scripts/stage-data.sh    # IMDb -> Parquet -> workers
-scripts/deploy.sh        # scheduler + executors
-scripts/run.sh 2000 16   # replay 2000 queries at concurrency 16  (run.sh N K)
-scripts/status.sh
+scripts/setup-node.sh    # one-time: create the /storage dirs and install build deps (rust, protoc, duckdb, kubectl helpers)
+scripts/gen-workload.sh  # generate the query set: clone Redbench, download the Redset trace, write workload.csv to $WORKLOAD_CSV
+scripts/build.sh         # build the Ballista scheduler/executor Docker images + ballista-cli from the fork, load them on the workers
+scripts/stage-data.sh    # download the IMDb/JOB CSVs, convert to Parquet, copy the tables to every worker node
+scripts/deploy.sh        # render the manifests from .env and apply the scheduler pod + executor DaemonSet
+scripts/run.sh 2000 16   # replay 2000 workload queries with 16 concurrent ballista-cli drivers; capture per-run metrics
+scripts/status.sh        # show pod placement and how many executors have registered
 ```
 
-`build.sh` clones the Ballista fork (set in `.env`), node roles are auto-derived,
-and the Redbench `workload.csv` must be placed at `$WORKLOAD_CSV` before `run.sh`.
+Notes: `gen-workload.sh` is heavy (downloads a ~18 GB Redset trace) and only
+needed once - skip it if `$WORKLOAD_CSV` already exists. `build.sh` clones the
+Ballista fork (`BALLISTA_REPO`/`BALLISTA_REF` in `.env`); node roles are
+auto-derived from the cluster.
 
 ## Layout
 
