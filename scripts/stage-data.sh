@@ -9,7 +9,12 @@ mkdir -p "$csv" "$DATA_DIR"
 [ -f "$csv/title.csv" ] || curl -L "$IMDB_URL" | tar -xz -C "$csv"
 python3 bin/imdb_to_parquet.py --schema data/imdb_schema.sql --csv-dir "$csv" --out-dir "$DATA_DIR"
 
+echo "copying dataset to workers in parallel: $WORKER_NODES"
 for w in $WORKER_NODES; do
-  echo "copying dataset to $w"
-  rsync -a --delete "$DATA_DIR/" "$w:$DATA_DIR/"
+  rsync -a --delete "$DATA_DIR/" "$w:$DATA_DIR/" &
+done
+wait
+echo "staged; tables per worker:"
+for w in $WORKER_NODES; do
+  printf "  %s: " "$w"; ssh "$w" "ls '$DATA_DIR' 2>/dev/null | wc -l"
 done
