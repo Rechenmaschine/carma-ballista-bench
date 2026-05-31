@@ -5,8 +5,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; . ./.env; set +a
 
-# Ctrl-C cleanly stops all drivers + the progress tail.
-trap 'echo; echo "stopping..."; pkill -P $$ 2>/dev/null; exit 130' INT TERM
+# Ctrl-C cleanly stops the drivers and the progress tail. pkill -P only reaches
+# direct children, so kill the progress subshell's own children (the kubectl
+# log-follow) first, otherwise it orphans and keeps printing after exit.
+cleanup() {
+  trap - INT TERM
+  echo; echo "stopping..."
+  [ -n "${prog:-}" ] && pkill -P "$prog" 2>/dev/null   # kubectl/grep/awk in the tail
+  pkill -P $$ 2>/dev/null                               # drivers + the tail subshell
+  exit 130
+}
+trap cleanup INT TERM
 
 queries=${1:-2000}
 concurrency=${2:-1}
