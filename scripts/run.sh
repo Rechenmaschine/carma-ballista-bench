@@ -18,8 +18,9 @@ cli=$BALLISTA_SRC/target/release/ballista-cli
 # Don't benchmark an unhealthy cluster (a flapping cluster silently drops jobs).
 execs=$(curl -s "http://$sched:$SCHEDULER_PORT/api/executors" | grep -o '"host":' | wc -l)
 [ "$execs" -ge 1 ] || { echo "no executors registered (scheduler $sched) - check scripts/status.sh"; rmdir "$run"; exit 1; }
-echo "executors registered: $execs"
+echo ">> run '$name': $queries queries, concurrency $concurrency, scheduler $sched ($execs executors)"
 
+echo ">> [1/3] generating SQL..."
 python3 bin/gen_sql.py --workload "$WORKLOAD_CSV" --data-dir "$DATA_DIR" \
   --out-dir "$run" --limit "$queries" --shards "$concurrency"
 
@@ -27,6 +28,7 @@ python3 bin/gen_sql.py --workload "$WORKLOAD_CSV" --data-dir "$DATA_DIR" \
 # emitted since then (one shot - no fragile long-lived `logs -f` stream).
 start=$(date -u -d '2 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
 
+echo ">> [2/3] submitting queries (this is the timed part)..."
 if [ "$concurrency" -le 1 ]; then
   "$cli" --host "$sched" --port "$SCHEDULER_PORT" --quiet -f "$run/setup.sql" -f "$run/workload.sql" > "$run/cli.log" 2>&1
 else
@@ -38,6 +40,7 @@ else
   wait $pids
 fi
 
+echo ">> [3/3] collecting scheduler metrics..."
 kubectl -n "$NAMESPACE" logs deploy/ballista-scheduler --since-time="$start" > "$run/stages.jsonl"
 
 submitted=$(cat "$run"/workload*.sql 2>/dev/null | grep -c ';')
