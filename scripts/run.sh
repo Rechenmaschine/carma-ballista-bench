@@ -38,13 +38,22 @@ python3 bin/gen_sql.py --workload "$WORKLOAD_CSV" --data-dir "$DATA_DIR" \
 
 start=$(date -u -d '2 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
 
+# The full per-stage CARMA trace (kind:"stage_trace") is appended by the
+# scheduler to a fixed host file. Record its size now so we can slice out
+# exactly this run's portion afterwards (the writer is append-only and shared
+# across runs of the same deployment).
+trace_file="$TRACE_DIR/stages.jsonl"
+trace_off=$([ -f "$trace_file" ] && wc -c < "$trace_file" || echo 0)
+
 echo ">> [2/3] submitting queries (this is the timed part)..."
-# Stream the scheduler's metrics to disk LIVE and derive the progress counter
-# from the same stream. A post-hoc `logs --since-time` loses lines once kubelet
-# rotates the container log (it silently dropped ~75% of a 2000-query run).
+# Stream the scheduler's ROLLUP metrics to disk LIVE and derive the progress
+# counter from the same stream. A post-hoc `logs --since-time` loses lines once
+# kubelet rotates the container log (it silently dropped ~75% of a 2000-query
+# run). This stream is the lightweight rollup (kind:stage/job); the full
+# carma trace is the host file sliced below.
 ( kubectl -n "$NAMESPACE" logs deploy/ballista-scheduler -f --since-time="$start" 2>/dev/null \
     | grep --line-buffered '"kind":"' \
-    | tee "$run/stages.jsonl" \
+    | tee "$run/rollups.jsonl" \
     | grep --line-buffered '"kind":"job"' \
     | awk "{ printf \"\r  completed: %d/$queries\", NR; fflush() }" ) &
 prog=$!
@@ -60,19 +69,59 @@ else
   wait $pids
 fi
 
-sleep 2                                              # let trailing rollups flush into the stream
+sleep 2                                              # let trailing rollups + trace lines flush
 pkill -P "$prog" 2>/dev/null; kill "$prog" 2>/dev/null || true; echo
-echo ">> [3/3] metrics captured live -> $run/stages.jsonl"
+
+# Slice this run's portion of the shared trace file into the run dir. This is
+# the artifact carma-all ingests (carma::trace::load_stage_trace).
+tail -c "+$((trace_off + 1))" "$trace_file" > "$run/stages.jsonl" 2>/dev/null || : > "$run/stages.jsonl"
+echo ">> [3/3] full trace -> $run/stages.jsonl  (rollups -> $run/rollups.jsonl)"
+
+# Run-level cluster shape + pricing (carma ClusterHardware / PricingConfig).
+# num_executors / cores / memory are MEASURED from the live cluster; cache,
+# bandwidth and pricing are the modeled knobs from .env. Without this carma's
+# trace_replay falls back to a guessed reference cluster.
+wcap=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+  -o jsonpath='{.items[0].status.capacity.cpu} {.items[0].status.capacity.memory}' 2>/dev/null || echo "0 0Ki")
+cores=${wcap%% *}; memraw=${wcap##* }
+case "$memraw" in
+  *Ki) mem_bytes=$(( ${memraw%Ki} * 1024 )) ;;
+  *Mi) mem_bytes=$(( ${memraw%Mi} * 1048576 )) ;;
+  *Gi) mem_bytes=$(( ${memraw%Gi} * 1073741824 )) ;;
+  *[0-9]) mem_bytes=$memraw ;;
+  *) mem_bytes=0 ;;
+esac
+cat > "$run/cluster.json" <<JSON
+{
+  "cluster_hardware": {
+    "num_executors": $execs,
+    "cores_per_executor": ${cores:-0},
+    "memory_per_executor_bytes": $mem_bytes,
+    "cache_bytes_per_executor": $CACHE_BYTES_PER_EXECUTOR,
+    "intra_cluster_bandwidth_bps": $INTRA_CLUSTER_BANDWIDTH_BPS
+  },
+  "pricing": {
+    "price_vcpu_hour": $PRICE_VCPU_HOUR,
+    "price_gb_transferred": $PRICE_GB_TRANSFERRED
+  }
+}
+JSON
 
 submitted=$(cat "$run"/workload*.sql 2>/dev/null | grep -c ';')
-jobs=$(grep -c '"kind":"job"' "$run/stages.jsonl" || true)
+jobs=$(grep -c '"kind":"job"' "$run/rollups.jsonl" || true)
+stage_records=$(grep -c '"kind":"stage_trace"' "$run/stages.jsonl" || true)
 {
   echo "queries_requested=$queries"
   echo "queries_submitted=$submitted"
   echo "concurrency=$concurrency"
   echo "date=$(date -Is)"
   echo "jobs=$jobs"
-  echo "stages=$(grep -c '"kind":"stage"' "$run/stages.jsonl" || true)"
+  echo "stage_records=$stage_records"
 } | tee "$run/meta.txt"
-[ "$jobs" -lt "$submitted" ] && echo "WARNING: captured $jobs/$submitted job rollups - cluster may have been unhealthy mid-run" | tee -a "$run/meta.txt"
+if [ "$stage_records" -eq 0 ]; then
+  echo "WARNING: no stage_trace records captured - is BALLISTA_STAGE_TRACE_FILE set on the scheduler? (re-run deploy.sh after pulling)" | tee -a "$run/meta.txt"
+fi
+if [ "$jobs" -lt "$submitted" ]; then
+  echo "WARNING: captured $jobs/$submitted job rollups - cluster may have been unhealthy mid-run" | tee -a "$run/meta.txt"
+fi
 echo "results: $run"

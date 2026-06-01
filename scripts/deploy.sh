@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; . ./.env; set +a
 
-vars='$NAMESPACE $CONTROL_NODE $IMAGE_TAG $DATA_DIR $WORK_DIR'
+vars='$NAMESPACE $CONTROL_NODE $IMAGE_TAG $DATA_DIR $WORK_DIR $TRACE_DIR'
 render() { for t in manifests/*.yaml.tmpl; do envsubst "$vars" < "$t"; echo ---; done; }
 
 echo ">> wiping namespace $NAMESPACE"
@@ -18,5 +18,11 @@ kubectl wait --for=delete namespace/"$NAMESPACE" --timeout=120s || {
     | jq 'del(.spec.finalizers)' \
     | kubectl replace --raw "/api/v1/namespaces/$NAMESPACE/finalize" -f -
 }
+# Fresh trace file for the new scheduler. The writer opens it append-mode at
+# startup (hostPath persists across pods), so truncate now that the old pod is
+# gone — each deploy starts a clean trace; run.sh still slices per run on top.
+echo ">> preparing trace dir $TRACE_DIR (on $CONTROL_NODE)"
+mkdir -p "$TRACE_DIR" && chmod 777 "$TRACE_DIR" && : > "$TRACE_DIR/stages.jsonl"
+
 echo ">> deploying"
 render | kubectl apply -f -

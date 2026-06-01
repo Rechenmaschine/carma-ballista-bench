@@ -24,7 +24,12 @@ spec:
           imagePullPolicy: Never
           args: ["--bind-host=0.0.0.0", "--bind-port=50050", "--external-host=ballista-scheduler"]
           env:
+            # Rollup printer -> stdout: drives run.sh's live "completed N/M" counter.
             - { name: BALLISTA_STAGE_METRICS, value: json }
+            # Full per-stage trace -> file: the format carma-all ingests
+            # (kind:"stage_trace", full plan tree + per-task timings + DAG edges).
+            # Written to the `trace` hostPath; run.sh slices each run's portion.
+            - { name: BALLISTA_STAGE_TRACE_FILE, value: ${TRACE_DIR}/stages.jsonl }
           ports:
             - { containerPort: 50050 }
           readinessProbe:
@@ -33,9 +38,12 @@ spec:
           # it needs the dataset at the same path as the executors.
           volumeMounts:
             - { name: data, mountPath: ${DATA_DIR}, readOnly: true }
+            - { name: trace, mountPath: ${TRACE_DIR} }
       volumes:
         - name: data
           hostPath: { path: ${DATA_DIR}, type: Directory }
+        - name: trace
+          hostPath: { path: ${TRACE_DIR}, type: DirectoryOrCreate }
 ---
 apiVersion: v1
 kind: Service
