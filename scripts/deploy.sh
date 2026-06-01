@@ -26,3 +26,20 @@ mkdir -p "$TRACE_DIR" && chmod 777 "$TRACE_DIR" && : > "$TRACE_DIR/stages.jsonl"
 
 echo ">> deploying"
 render | kubectl apply -f -
+
+# Pin the cluster's observability add-ons (dashboard + metrics-scraper) to the
+# control node. They live in kube-system (not our manifests) and ship with no
+# nodeSelector, so the default scheduler spreads them onto whatever worker looks
+# free - landing them ON an executor node. There they (a) compete with the
+# CPU-pinned executor for that node's ~2 cores of system headroom, helping tip
+# it into NotReady flaps under load, and (b) become unreachable through the
+# apiserver proxy whenever that worker flaps (the dashboard Service's only
+# endpoint is its pod). Pinning them to $CONTROL_NODE keeps workers
+# executor-only and the dashboard served from the (unloaded) control node. They
+# already tolerate the control-plane taint; this adds the missing "put me here".
+# Idempotent: re-asserted on every deploy, skipped if an add-on isn't installed.
+echo ">> pinning observability add-ons to $CONTROL_NODE"
+for d in kubernetes-dashboard kubernetes-metrics-scraper; do
+  kubectl -n kube-system get deploy "$d" >/dev/null 2>&1 || { echo "  $d not present, skipping"; continue; }
+  kubectl -n kube-system patch deploy "$d" --type=merge -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$CONTROL_NODE\"},\"tolerations\":[{\"key\":\"node-role.kubernetes.io/control-plane\",\"operator\":\"Exists\",\"effect\":\"NoSchedule\"}]}}}}"
+done
