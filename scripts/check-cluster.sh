@@ -60,10 +60,14 @@ else bad "TASK_SLOTS=$TASK_SLOTS (${want}m) EXCEEDS smallest allocatable CPU (${
 # nosmt taking effect), the node reports double the cores and is no longer
 # comparable to the others.
 for n in "${workers[@]}"; do
-  a=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$n" 'cat /sys/devices/system/cpu/smt/active 2>/dev/null' 2>/dev/null)
-  if   [ "$a" = "0" ]; then ok "$n hyperthreading off"
-  elif [ -z "$a" ];    then warn "$n unreachable - SMT state unknown"
-  else                      bad "$n hyperthreading is ON (smt/active=$a) - run setup-node.sh / disable_smt"; fi
+  read -r a mn mx < <(ssh -o BatchMode=yes -o ConnectTimeout=8 "$n" 'echo "$(cat /sys/devices/system/cpu/smt/active 2>/dev/null) $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 2>/dev/null) $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null)"' 2>/dev/null)
+  if [ -z "$a" ]; then warn "$n unreachable - SMT/clock unknown"; continue; fi
+  [ "$a" = "0" ] && ok "$n hyperthreading off" || bad "$n hyperthreading is ON (smt/active=$a) - run setup-node.sh"
+  # governor=performance alone is NOT enough: idle cores still drop to the floor
+  # (and sleep in C-states), inflating low-concurrency task times. Require the
+  # floor pinned to the ceiling so the clock is fixed regardless of load.
+  if [ -n "$mn" ] && [ "$mn" = "$mx" ]; then ok "$n cpu clock pinned ($((mx/1000)) MHz, fixed)"
+  else bad "$n cpu clock NOT pinned (min=$mn max=$mx) - idle cores will downclock; run setup-node.sh"; fi
 done
 
 # ---------------------------------------------------------------------------

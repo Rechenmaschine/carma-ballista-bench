@@ -31,20 +31,27 @@ spec:
             # the CPU pin below this equals the CPU budget, so slots == cores
             # and we never schedule more tasks than the executor has cores.
             - --concurrent-tasks=${TASK_SLOTS}
-          # Pin every executor's CPU to exactly TASK_SLOTS cores (request ==
-          # limit, hard-capped by the CFS quota), so all nodes look IDENTICAL
-          # even though they have 16 vs 20 real cores (hyperthreading disabled
-          # via setup-node.sh). This makes cores_per_executor a single
-          # well-defined number for the cost model. Memory is intentionally left
-          # unbounded (no limit) so an executor can use its node's full RAM -
-          # nodes are RAM-equal so this stays uniform, and a memory limit would
-          # risk OOM-kills on heavy queries. (QoS is therefore Burstable, not
-          # Guaranteed; with the default CPU-manager policy that makes no
-          # difference to CPU behaviour.) TASK_SLOTS must be <= the smallest
-          # node's allocatable CPU (16 minus k8s reserve) or pods stay Pending.
+            # Give DataFusion a memory BUDGET so joins/aggregates SPILL to disk
+            # instead of allocating without limit. Without this the executor uses
+            # an unbounded memory pool and a big JOB join (e.g. cast_info, 36M
+            # rows) x TASK_SLOTS concurrent tasks eats the whole host -> OOM ->
+            # node hang. The executor splits this into a FairSpillPool of
+            # EXEC_MEM_POOL/concurrent_tasks per task. Keep it below the cgroup
+            # limit (EXEC_MEM_LIMIT) so spilling kicks in before the OOM-killer.
+            - --memory-pool-size=${EXEC_MEM_POOL}
+          # Pin every executor's CPU to exactly TASK_SLOTS cores (request==limit,
+          # CFS-capped) so all nodes look IDENTICAL despite 16 vs 20 real cores
+          # (HT disabled via setup-node.sh) - cores_per_executor is one number.
+          # Memory IS capped (EXEC_MEM_LIMIT). Leaving it unbounded let a heavy
+          # JOB join grab the WHOLE host (~62 GiB) and trigger a system-wide OOM
+          # that hung the node (kubelet/sshd die -> NotReady; killed node-2 &
+          # node-3). A cgroup memory limit instead OOM-kills just the pod (the
+          # job fails, k8s restarts it) and the HOST survives. Keep EXEC_MEM_LIMIT
+          # well below node RAM (headroom for OS + kubelet + CNI). TASK_SLOTS must
+          # be <= the smallest node's allocatable CPU or pods stay Pending.
           resources:
             requests: { cpu: "${TASK_SLOTS}" }
-            limits:   { cpu: "${TASK_SLOTS}" }
+            limits:   { cpu: "${TASK_SLOTS}", memory: "${EXEC_MEM_LIMIT}" }
           env:
             - name: POD_IP
               valueFrom:

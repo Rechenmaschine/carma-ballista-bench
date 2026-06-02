@@ -4,28 +4,47 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; . ./.env; set +a
 
-# Disable hyperthreading (SMT) so each task slot maps to a real physical core,
-# not a sibling thread - otherwise "40 cores" is really 20 cores + 20 siblings
-# and cores_per_executor overstates compute. Runtime toggle for immediate
-# effect, `nosmt` in GRUB so it survives reboots, then restart kubelet so
-# kubernetes re-reports the real (halved) core count. Baked in here so every
-# node is identical + reproducible; check-cluster.sh asserts it stayed off.
-disable_smt() {
+# Make every node DETERMINISTIC for benchmarking. Two knobs:
+#  1. Disable hyperthreading (SMT) so a task slot maps to a real physical core,
+#     not a sibling thread (else cores_per_executor overstates compute). `nosmt`
+#     in GRUB persists across reboot.
+#  2. Pin the CPU clock: governor=performance + turbo OFF => a FIXED base
+#     frequency on every core. The default `schedutil` governor swings the clock
+#     ~1.2-3.2 GHz with load, so cold/early tasks run slow and later tasks fast
+#     (a ~1.8x within-run warm-up) AND different nodes idle at different clocks -
+#     which silently pollutes per-task times and breaks the homogeneity the CPU
+#     pin is supposed to give. Turbo is off because it's thermal/neighbour-
+#     dependent and not sustainable on all cores at once => nondeterministic.
+# Then restart kubelet so k8s re-reports the halved (SMT-off) core count.
+# check-cluster.sh asserts SMT off + governor=performance.
+tune_node() {
   echo off | sudo tee /sys/devices/system/cpu/smt/control >/dev/null 2>&1
   grep -q nosmt /etc/default/grub || {
     sudo sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 nosmt"/' /etc/default/grub
     sudo update-grub >/dev/null 2>&1
   }
+  for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance | sudo tee "$g" >/dev/null 2>&1; done
+  [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo >/dev/null 2>&1
+  [ -e /sys/devices/system/cpu/cpufreq/boost ] && echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost >/dev/null 2>&1
+  # governor=performance caps the MAX but leaves the floor low: idle cores still
+  # drop to ~1.2GHz and sleep in C-states, so at low concurrency tasks land on
+  # cold cores and ramp up mid-execution -> their measured compute is inflated,
+  # which made "total work" spuriously DECREASE with concurrency. Pin the floor
+  # to the ceiling AND disable deep C-states so every core holds a fixed ~2.4GHz
+  # whether busy or idle -> per-task compute is concurrency-independent.
+  [ -e /sys/devices/system/cpu/intel_pstate/min_perf_pct ] && echo 100 | sudo tee /sys/devices/system/cpu/intel_pstate/min_perf_pct >/dev/null 2>&1
+  for c in /sys/devices/system/cpu/cpu*/cpufreq; do sudo tee "$c/scaling_min_freq" < "$c/scaling_max_freq" >/dev/null 2>&1; done
+  for s in /sys/devices/system/cpu/cpu*/cpuidle/state[1-9]; do echo 1 | sudo tee "$s/disable" >/dev/null 2>&1; done
   sudo systemctl restart kubelet 2>/dev/null || true
 }
 
 sudo mkdir -p "$ROOT"; sudo chown -R "$(id -un):" "$ROOT"
-echo ">> disabling SMT on control node"; disable_smt
+echo ">> tuning control node (SMT off, fixed clock)"; tune_node
 for w in $WORKER_NODES; do
-  echo ">> preparing $w (storage, iperf3, SMT off)"
-  # storage dirs + iperf3 (for check-cluster.sh --net) + disable SMT
+  echo ">> preparing $w (storage, iperf3, SMT off, fixed clock)"
+  # storage dirs + iperf3 (for check-cluster.sh --net) + SMT off + clock pin
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$w" \
-    "sudo mkdir -p $ROOT && sudo chown -R \$(id -un): $ROOT && sudo apt-get install -y -qq iperf3; $(declare -f disable_smt); disable_smt" \
+    "sudo mkdir -p $ROOT && sudo chown -R \$(id -un): $ROOT && sudo apt-get install -y -qq iperf3; $(declare -f tune_node); tune_node" \
     || echo "  $w unreachable, skipped"
 done
 
