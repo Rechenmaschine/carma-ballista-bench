@@ -39,7 +39,12 @@ tune_node() {
 }
 
 sudo mkdir -p "$ROOT"; sudo chown -R "$(id -un):" "$ROOT"
-echo ">> tuning control node (SMT off, fixed clock)"; tune_node
+echo ">> tuning control node (SMT off, fixed clock)"
+# Best-effort: every knob suppresses errors, but `set -e` would still abort the
+# whole script (incl. the dep installs below) if a sysfs write is rejected --
+# e.g. no_turbo/min_perf_pct on a CPU running intel_pstate in passive mode. Keep
+# tuning non-fatal; check-cluster.sh is what asserts the knobs that must hold.
+tune_node || echo "  (some tuning knobs not settable on this node; continuing -- verify with check-cluster.sh)"
 for w in $WORKER_NODES; do
   echo ">> preparing $w (storage, iperf3, SMT off, fixed clock)"
   # storage dirs + iperf3 (for check-cluster.sh --net) + SMT off + clock pin
