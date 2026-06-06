@@ -35,8 +35,14 @@ KS="${KS:-1 2 3 4 5 6 7 8 9 10 15 20}"; REPS="${REPS:-1 2 3 4 5}"; QUERIES="${QU
 
 # Preflight: don't start a multi-hour sweep that can't run a single point.
 [ -f "$WORKLOAD_CSV" ] || { echo "FATAL: $WORKLOAD_CSV missing - run scripts/gen-workload.sh first"; exit 1; }
-total=$(( $(echo $KS | wc -w) * $(echo $REPS | wc -w) )); i=0; sweep_start=$(date +%s)
+total=$(( $(echo $KS | wc -w) * $(echo $REPS | wc -w) )); i=0; ran=0; sweep_start=$(date +%s)
 fmt() { printf "%02d:%02d:%02d" $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
+
+# Resume: a point is done if some earlier run dir for it captured all jobs.
+# Makes restarting after an abort cheap (completed points are skipped).
+point_done() { local m; for m in "$RUNS_DIR"/$1-*/meta.txt; do
+  [ -f "$m" ] && [ "$(sed -n 's/^jobs=//p' "$m")" = "$QUERIES" ] && return 0
+done; return 1; }
 
 echo "############################################################"
 echo "## CARMA grid sweep: $total points (K={$KS} x rep={$REPS}), $QUERIES queries each"
@@ -46,6 +52,7 @@ echo "############################################################"
 for rep in $REPS; do
   for K in $KS; do
     i=$((i+1)); name=g${K}r${rep}; t0=$(date +%s)
+    if point_done "$name"; then echo "## [$i/$total] $name already complete - skip"; continue; fi
     echo
     echo "############################################################"
     echo "## [$i/$total] $name   K=$K  rep=$rep   start $(date +%T)"
@@ -68,8 +75,9 @@ for rep in $REPS; do
     # instead of grinding out 60 unusable points.
     [ "$rc" -ne 0 ] && { echo "## ABORT: $name failed rc=$rc - fix and restart sweep"; exit 1; }
 
-    dur=$(( $(date +%s)-t0 )); elapsed=$(( $(date +%s)-sweep_start ))
-    avg=$(( elapsed / i )); eta=$(( avg * (total-i) ))
+    # avg over points run THIS session (skipped points would skew the ETA)
+    ran=$((ran+1)); dur=$(( $(date +%s)-t0 )); elapsed=$(( $(date +%s)-sweep_start ))
+    avg=$(( elapsed / ran )); eta=$(( avg * (total-i) ))
     echo "## [$i/$total] $name DONE rc=$rc in $(fmt $dur)   | $(grep -hE 'jobs=' /storage/carma/runs/${name}-*/meta.txt 2>/dev/null | head -1)"
     echo "## progress: $i/$total done | sweep elapsed $(fmt $elapsed) | est. remaining $(fmt $eta)"
   done

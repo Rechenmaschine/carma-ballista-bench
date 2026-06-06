@@ -12,11 +12,14 @@ render() { for t in manifests/*.yaml.tmpl; do envsubst "$vars" < "$t"; echo ---;
 echo ">> wiping namespace $NAMESPACE"
 kubectl delete namespace "$NAMESPACE" --ignore-not-found --wait=false
 echo ">> waiting for $NAMESPACE to terminate"
-kubectl wait --for=delete namespace/"$NAMESPACE" --timeout=120s || {
+# python3, NOT jq: jq isn't installed on the nodes, and a missing tool here
+# once killed deploy mid-wipe and stranded the namespace in Terminating.
+kubectl wait --for=delete namespace/"$NAMESPACE" --timeout=300s || {
   echo "!! namespace stuck terminating, clearing finalizers" >&2
   kubectl get ns "$NAMESPACE" -o json \
-    | jq 'del(.spec.finalizers)' \
+    | python3 -c 'import json,sys; o=json.load(sys.stdin); o["spec"]["finalizers"]=[]; print(json.dumps(o))' \
     | kubectl replace --raw "/api/v1/namespaces/$NAMESPACE/finalize" -f -
+  kubectl wait --for=delete namespace/"$NAMESPACE" --timeout=120s
 }
 # Fresh trace file for the new scheduler. The writer opens it append-mode at
 # startup (hostPath persists across pods), so truncate now that the old pod is
