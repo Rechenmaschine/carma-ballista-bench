@@ -11,9 +11,17 @@ set -a; . ./.env; set +a
 tmux kill-session -t carma 2>/dev/null; pkill -f "ballista-cli --host" 2>/dev/null; pkill -f "scripts/run.sh" 2>/dev/null; sleep 3
 
 # Expected executor count = one per worker node (daemonset), NOT hardcoded.
+# Never benchmark a partial cluster: spin until ALL are Running, fail after
+# EXEC_WAIT seconds (-> sweep aborts). (locals: MUST NOT clobber the global
+# point counter - a `for i` here once corrupted [i/total].)
 EXECS_WANT=$(echo $WORKER_NODES | wc -w)
-# local i: MUST NOT clobber the global point counter (it did, corrupting [i/total])
-wait_execs() { local i; for i in $(seq 1 40); do [ "$(kubectl -n "$NAMESPACE" get pods -l app=ballista-executor --no-headers 2>/dev/null | grep -c Running)" -ge "$EXECS_WANT" ] && return 0; sleep 5; done; return 1; }
+EXEC_WAIT="${EXEC_WAIT:-600}"
+wait_execs() { local got n=0; while [ $((n * 5)) -lt "$EXEC_WAIT" ]; do
+  got=$(kubectl -n "$NAMESPACE" get pods -l app=ballista-executor --no-headers 2>/dev/null | grep -c Running)
+  [ "$got" -ge "$EXECS_WANT" ] && return 0
+  [ $((n % 12)) -eq 0 ] && echo "   waiting: $got/$EXECS_WANT executors Running"
+  n=$((n+1)); sleep 5
+done; return 1; }
 
 # per-run node prep: performance governor, no turbo, disable idle states, drop caches (reproducible timing)
 prep() { for n in $WORKER_NODES; do ssh -o BatchMode=yes -o ConnectTimeout=8 "$n" '
@@ -46,7 +54,8 @@ for rep in $REPS; do
     echo "-- deploy (wipe + redeploy + pin) --------------------------"
     ./scripts/deploy.sh
     echo "-- wait for $EXECS_WANT executors --------------------------------"
-    wait_execs && echo "   ok: $EXECS_WANT executors Running" || echo "   WARN: <$EXECS_WANT executors after 200s, running anyway (run.sh will abort if they never register)"
+    wait_execs && echo "   ok: $EXECS_WANT executors Running" \
+      || { echo "## ABORT: <$EXECS_WANT executors Running after ${EXEC_WAIT}s - cluster unhealthy, fix and restart sweep"; exit 1; }
     echo "-- node prep (governor/turbo/idle/caches) ------------------"
     prep; echo "   prep done"
 
