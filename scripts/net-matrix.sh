@@ -14,6 +14,14 @@ set -a; . ./.env; set +a
 ns=netmatrix
 img=nicolaka/netshoot
 dur=${1:-3}
+# Parallel iperf3 streams. Match the shuffle reader's fan-in concurrency
+# (ballista.shuffle.max_concurrent_read_requests, default 64): the cost model
+# charges a task's whole remote read at this bandwidth, and a real shuffle
+# fetches its fan-in over many concurrent streams -> we want the AGGREGATE
+# throughput, not a single TCP flow (which tops out far lower on a pod overlay
+# and is what made the model look ~8x too fast). Override with PSTREAMS=N (=1
+# recovers the old single-stream number).
+pstreams=${PSTREAMS:-64}
 
 cleanup() { kubectl delete ns "$ns" --force --grace-period=0 >/dev/null 2>&1; }
 trap cleanup EXIT
@@ -70,7 +78,7 @@ for s in "${nodes[@]}"; do
   cmd="sleep 2;"
   for d in "${nodes[@]}"; do
     [ "$s" = "$d" ] && continue
-    cmd="${cmd}echo D=$d; { iperf3 -c ${ip[$d]} -t $dur -f m || iperf3 -c ${ip[$d]} -t $dur -f m; } | awk '/receiver/{print \$7}';"
+    cmd="${cmd}echo D=$d; { iperf3 -c ${ip[$d]} -t $dur -P $pstreams -f m || iperf3 -c ${ip[$d]} -t $dur -P $pstreams -f m; } | awk '/receiver/{if(\$1==\"[SUM]\")v=\$6; else if(v==\"\")v=\$7} END{print v}';"
   done
   echo ">> src $s ..."
   out=$(kubectl -n "$ns" run "c-${s#node-}" --image=$img --restart=Never --rm -i \
@@ -88,7 +96,7 @@ done
 # Median (for outlier flagging).
 med=$(echo $allvals | tr ' ' '\n' | grep . | sort -n | awk '{a[NR]=$1} END{print (NR%2)? a[(NR+1)/2] : int((a[NR/2]+a[NR/2+1])/2)}')
 echo
-echo "== pod-to-pod bandwidth matrix (Gbit/s, rows=src -> cols=dst) =="
+echo "== pod-to-pod bandwidth matrix (Gbit/s aggregate over $pstreams streams, rows=src -> cols=dst) =="
 printf "      "; for d in "${nodes[@]}"; do printf "%7s" "->${d#node-}"; done; echo
 for s in "${nodes[@]}"; do
   printf "%-6s" "${s#node-}"
@@ -104,4 +112,4 @@ for s in "${nodes[@]}"; do
   echo
 done
 echo "median=$(awk -v m="$med" 'BEGIN{printf "%.2f", m/1000}') Gbit/s   (* = link < 60% of median; ? = no result)"
-echo ">> cost-model intra-cluster bandwidth (set in carma-all, not .env): median = $(( med * 1000000 )) bps"
+echo ">> cost-model intra-cluster bandwidth (set in carma-all, not .env): median = $(( med * 1000000 )) bps  (aggregate over $pstreams streams = the throughput a shuffle fan-in actually achieves)"

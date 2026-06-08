@@ -14,6 +14,12 @@ cd "$(dirname "$0")/.."
 set -a; . ./.env; set +a
 
 net=0; [ "${1:-}" = "--net" ] && net=1
+# Parallel iperf3 streams for --net: match the shuffle reader's fan-in
+# concurrency (ballista.shuffle.max_concurrent_read_requests, default 64) so we
+# measure the AGGREGATE throughput a shuffle achieves, not a single TCP flow.
+# This is the number the cost model wants. Override with PSTREAMS=N (=1 for the
+# old single-stream link speed).
+pstreams=${PSTREAMS:-64}
 
 fail=0
 ok()   { echo "  OK:   $*"; }
@@ -118,7 +124,7 @@ done
 
 # ---------------------------------------------------------------------------
 if [ "$net" = 1 ]; then
-  echo; echo "== intra-cluster throughput (iperf3, worker -> worker) =="
+  echo; echo "== intra-cluster throughput (iperf3 -P $pstreams aggregate, worker -> worker) =="
   srv=${workers[0]}
   if ! ssh -o BatchMode=yes "$srv" 'command -v iperf3 >/dev/null'; then
     warn "iperf3 not installed on $srv - skipping. Install it (it's in setup-node.sh now): sudo apt-get install -y iperf3"
@@ -127,7 +133,7 @@ if [ "$net" = 1 ]; then
     sleep 1
     bws=""
     for w in "${workers[@]:1}"; do
-      bps=$(ssh -o BatchMode=yes "$w" "command -v iperf3 >/dev/null && iperf3 -c $srv -t 5 -J 2>/dev/null" \
+      bps=$(ssh -o BatchMode=yes "$w" "command -v iperf3 >/dev/null && iperf3 -c $srv -t 5 -P $pstreams -J 2>/dev/null" \
         | python3 -c 'import sys,json;
 try:
  print(int(json.load(sys.stdin)["end"]["sum_received"]["bits_per_second"]))
@@ -141,7 +147,7 @@ except Exception: print("")' 2>/dev/null)
     if [ -n "$bws" ]; then
       read -r mn mean <<<"$(echo $bws | tr ' ' '\n' | awk 'NR==1{m=$1} {s+=$1;n++; if($1<m)m=$1} END{printf "%d %d", m, s/n}')"
       echo "  min=$(awk -v b="$mn" 'BEGIN{printf "%.2f",b/1e9}') Gbit/s  mean=$(awk -v b="$mean" 'BEGIN{printf "%.2f",b/1e9}') Gbit/s"
-      echo "  -> measured intra-cluster bandwidth. This is a cost-model knob (set in carma-all, not .env)."
+      echo "  -> measured AGGREGATE intra-cluster bandwidth ($pstreams streams = the shuffle fan-in concurrency). This is the cost-model knob (set in carma-all, not .env)."
       echo "     median above; conservative = min link = $mn bps."
     fi
   fi
