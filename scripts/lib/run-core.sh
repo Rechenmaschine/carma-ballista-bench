@@ -22,10 +22,18 @@ name=${3:+$3-}$ts
 run=$RUNS_DIR/$name
 mkdir -p "$run"
 
-# S3 storage reads remote: make sure MinIO is up before timing anything.
+# S3 storage reads remote: make sure MinIO is up before timing anything, and
+# point the HOST-side client at a reachable endpoint. carma_submit registers the
+# s3:// tables on this control node (client-side schema inference), so it needs a
+# host-reachable MinIO address -- the pods' in-cluster http://minio:9000 doesn't
+# resolve here. The Service ClusterIP is reachable from the node via kube-proxy.
 if [ "$STORAGE" = s3 ]; then
   echo ">> waiting for MinIO..."
   kubectl -n "$NAMESPACE" rollout status deploy/minio --timeout=180s
+  cip=$(kubectl -n "$NAMESPACE" get svc minio -o jsonpath='{.spec.clusterIP}')
+  [ -n "$cip" ] || { echo "FATAL: cannot resolve MinIO ClusterIP"; rmdir "$run" 2>/dev/null; exit 1; }
+  export AWS_ENDPOINT="http://$cip:9000"   # overrides experiment.env's in-cluster name for the host client
+  echo ">> host S3 endpoint: $AWS_ENDPOINT"
 fi
 
 sched=$(kubectl -n "$NAMESPACE" get pod -l app=ballista-scheduler -o jsonpath='{.items[0].status.podIP}')
