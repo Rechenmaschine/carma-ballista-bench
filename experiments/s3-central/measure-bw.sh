@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Verify the MINIO_EGRESS_BW knob empirically: pull a test object from MinIO via a
-# pod on a worker node (the real pod-network read path executors use) and report
-# achieved throughput. Run after deploy.sh; compare unshaped vs capped.
-#   experiments/s3-central/measure-bw.sh [size_mib=4096] [worker_node]
+# Verify the MINIO_EGRESS_BW knob empirically. The annotation shapes MinIO's
+# AGGREGATE egress, and the real workload issues many concurrent S3 GETs, so we
+# pull a test object over N parallel streams from a worker pod and sum the
+# achieved throughput (a single TCP flow tops out ~2 Gbit on the overlay and
+# would under-report). Run after deploy.sh; compare unshaped vs capped.
+#   experiments/s3-central/measure-bw.sh [size_mib=512] [worker_node] [streams=16]
 set -euo pipefail
 export EXPERIMENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$EXPERIMENT_DIR/../../scripts/lib/common.sh"
 
-size_mib=${1:-4096}; node=${2:-}; bytes=$(( size_mib * 1024 * 1024 ))
+size_mib=${1:-512}; node=${2:-}; streams=${3:-16}; bytes=$(( size_mib * 1024 * 1024 ))
 kubectl -n "$NAMESPACE" get deploy minio >/dev/null 2>&1 || { echo "FATAL: MinIO not deployed in ns $NAMESPACE -- run deploy.sh first"; exit 1; }
 kubectl -n "$NAMESPACE" rollout status deploy/minio --timeout=120s >/dev/null
 
@@ -24,12 +26,13 @@ have=$("$mc" stat --json "carma/bwtest/obj-${size_mib}" 2>/dev/null | grep -o '"
 [ "${have:-0}" = "$bytes" ] || head -c "$bytes" /dev/zero | "$mc" pipe "carma/bwtest/obj-${size_mib}" >/dev/null
 kill $pf 2>/dev/null; trap - EXIT
 
-# 2. Pull it from a worker pod (subject to the MinIO pod's egress cap).
+# 2. Pull it over $streams parallel streams from a worker pod; sum throughput.
 [ -n "$node" ] || node=$(echo $WORKER_NODES | awk '{print $1}')
-echo ">> pulling ${size_mib} MiB from MinIO via pod on $node (cap=${MINIO_EGRESS_BW:-none})..."
-sp=$(kubectl -n "$NAMESPACE" run "bwtest-$$" --image=nicolaka/netshoot --restart=Never --rm -i \
+echo ">> pulling ${size_mib} MiB x ${streams} streams from MinIO via pod on $node (cap=${MINIO_EGRESS_BW:-none})..."
+bps=$(kubectl -n "$NAMESPACE" run "bwtest-$$" --image=nicolaka/netshoot --restart=Never --rm -i \
   --overrides="{\"apiVersion\":\"v1\",\"spec\":{\"nodeName\":\"$node\"}}" \
-  --command -- sh -c "curl -s -o /dev/null -w '%{speed_download}' http://minio:9000/bwtest/obj-${size_mib}" 2>/dev/null)
-awk -v b="$sp" -v cap="${MINIO_EGRESS_BW:-none}" 'BEGIN{
+  --command -- sh -c "for i in \$(seq 1 ${streams}); do curl -s -o /dev/null -w '%{speed_download}\n' http://minio:9000/bwtest/obj-${size_mib} & done; wait" 2>/dev/null \
+  | awk '{s+=$1} END{printf "%.0f", s}')
+awk -v b="$bps" -v st="$streams" -v cap="${MINIO_EGRESS_BW:-none}" 'BEGIN{
   if (b+0 <= 0) { print "FATAL: download failed (0 B/s) -- check MinIO reachability/auth"; exit 1 }
-  printf ">> measured: %.2f Gbit/s  (%.0f MB/s)   [cap=%s]\n", b*8/1e9, b/1e6, cap }'
+  printf ">> measured: %.2f Gbit/s aggregate over %d streams  (%.0f MB/s)   [cap=%s]\n", b*8/1e9, st, b/1e6, cap }'
