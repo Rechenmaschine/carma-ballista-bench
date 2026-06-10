@@ -20,7 +20,7 @@ pf=$!; trap 'kill $pf 2>/dev/null' EXIT; sleep 3
 "$mc" alias set carma "http://127.0.0.1:${MINIO_PORT}" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >/dev/null
 "$mc" mb --ignore-existing carma/bwtest >/dev/null
 "$mc" anonymous set download carma/bwtest >/dev/null
-have=$("$mc" stat --json "carma/bwtest/obj-${size_mib}" 2>/dev/null | grep -o '"size":[0-9]*' | head -1 | cut -d: -f2)
+have=$("$mc" stat --json "carma/bwtest/obj-${size_mib}" 2>/dev/null | grep -o '"size":[0-9]*' | head -1 | cut -d: -f2) || true   # absent object: grep exits 1, don't let pipefail kill us
 [ "${have:-0}" = "$bytes" ] || head -c "$bytes" /dev/zero | "$mc" pipe "carma/bwtest/obj-${size_mib}" >/dev/null
 kill $pf 2>/dev/null; trap - EXIT
 
