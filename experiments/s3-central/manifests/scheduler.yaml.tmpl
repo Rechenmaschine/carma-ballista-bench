@@ -1,0 +1,55 @@
+# s3-central scheduler: like the base scheduler but it lists Parquet over S3
+# (no dataset hostPath), so it carries the AWS_* env instead of a data volume.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ballista-scheduler
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: ballista-scheduler }
+  template:
+    metadata:
+      labels: { app: ballista-scheduler }
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ${CONTROL_NODE}
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: scheduler
+          image: ballista-scheduler:${IMAGE_TAG}
+          imagePullPolicy: Never
+          args: ["--bind-host=0.0.0.0", "--bind-port=50050", "--external-host=ballista-scheduler"]
+          env:
+            - { name: BALLISTA_STAGE_METRICS, value: json }
+            - { name: BALLISTA_STAGE_TRACE_FILE, value: ${TRACE_DIR}/stages.jsonl }
+            # S3 object store for s3:// LOCATIONs (AmazonS3Builder::from_env).
+            - { name: AWS_ENDPOINT,          value: "${AWS_ENDPOINT}" }
+            - { name: AWS_ACCESS_KEY_ID,     value: "${AWS_ACCESS_KEY_ID}" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "${AWS_SECRET_ACCESS_KEY}" }
+            - { name: AWS_REGION,            value: "${AWS_REGION}" }
+            - { name: AWS_ALLOW_HTTP,        value: "${AWS_ALLOW_HTTP}" }
+          ports:
+            - { containerPort: 50050 }
+          readinessProbe:
+            tcpSocket: { port: 50050 }
+          volumeMounts:
+            - { name: trace, mountPath: ${TRACE_DIR} }
+      volumes:
+        - name: trace
+          hostPath: { path: ${TRACE_DIR}, type: DirectoryOrCreate }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ballista-scheduler
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: ballista-scheduler }
+  ports:
+    - { port: 50050, targetPort: 50050 }

@@ -1,0 +1,52 @@
+# s3-central executor: like the base executor but scans read from S3 (no dataset
+# hostPath), so it carries the AWS_* env instead of a data volume. CPU/memory
+# pinning is unchanged, so the compute tier matches local-scan exactly.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ballista-executor
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    matchLabels: { app: ballista-executor }
+  template:
+    metadata:
+      labels: { app: ballista-executor }
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+      containers:
+        - name: executor
+          image: ballista-executor:${IMAGE_TAG}
+          imagePullPolicy: Never
+          args:
+            - --bind-host=0.0.0.0
+            - --bind-port=50051
+            - --scheduler-host=ballista-scheduler
+            - --scheduler-port=50050
+            - --work-dir=/work
+            - --external-host=$(POD_IP)
+            - --concurrent-tasks=${TASK_SLOTS}
+            - --memory-pool-size=${EXEC_MEM_POOL}
+          resources:
+            requests: { cpu: "${TASK_SLOTS}" }
+            limits:   { cpu: "${TASK_SLOTS}", memory: "${EXEC_MEM_LIMIT}" }
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+            # S3 object store for s3:// scans (AmazonS3Builder::from_env).
+            - { name: AWS_ENDPOINT,          value: "${AWS_ENDPOINT}" }
+            - { name: AWS_ACCESS_KEY_ID,     value: "${AWS_ACCESS_KEY_ID}" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "${AWS_SECRET_ACCESS_KEY}" }
+            - { name: AWS_REGION,            value: "${AWS_REGION}" }
+            - { name: AWS_ALLOW_HTTP,        value: "${AWS_ALLOW_HTTP}" }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+      volumes:
+        - name: work
+          hostPath: { path: ${WORK_DIR}, type: DirectoryOrCreate }

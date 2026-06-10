@@ -1,0 +1,52 @@
+# Single centralized MinIO storage node. Data is hostPath-backed on $MINIO_NODE,
+# so the uploaded bucket survives namespace wipes / redeploys. deploy-core.sh
+# optionally patches kubernetes.io/egress-bandwidth onto this pod to cap the
+# aggregate read throughput. Pinned to $MINIO_NODE (default: control node).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }                 # single hostPath writer
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ${MINIO_NODE}
+      tolerations:                              # in case $MINIO_NODE is the control node
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: minio
+          image: minio/minio
+          imagePullPolicy: IfNotPresent         # $MINIO_NODE must be able to pull this once
+          args: ["server", "/data", "--address", ":9000"]
+          env:
+            - { name: MINIO_ROOT_USER,     value: "${AWS_ACCESS_KEY_ID}" }
+            - { name: MINIO_ROOT_PASSWORD, value: "${AWS_SECRET_ACCESS_KEY}" }
+          ports:
+            - { containerPort: 9000 }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          hostPath: { path: ${MINIO_DATA_DIR}, type: DirectoryOrCreate }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: minio }
+  ports:
+    - { port: 9000, targetPort: 9000 }

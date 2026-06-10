@@ -7,40 +7,90 @@ A Redbench `workload.csv` (IMDb/JOB SQL) is replayed against a distributed Apach
 DataFusion Ballista cluster on CloudLab Kubernetes; per-run metrics land in
 `runs/<name>/`.
 
+## Experiments
+
+Two storage topologies share one cluster, one workload, and one runner — they
+differ only in *where the Parquet lives*, so results are directly comparable:
+
+- **`local-scan`** — the dataset is replicated on every worker (hostPath); every
+  scan is node-local. The original benchmark.
+- **`s3-central`** — the dataset lives on one centralized MinIO node; every scan
+  reads it remotely over S3. All workers stay executors, so the compute tier is
+  identical to `local-scan`; the only variable is the data source. MinIO's
+  read bandwidth is optionally capped (`MINIO_EGRESS_BW`).
+
+Each experiment is a thin wrapper in `experiments/<name>/` over shared logic in
+`scripts/lib/`; per-experiment config lives in `experiments/<name>/experiment.env`.
+
 ## Usage
 
-Run on the control node of a fresh cluster:
+Run on the control node of a fresh cluster. Steps 1–4 are shared, one-time setup:
 
 ```sh
 git clone https://github.com/Rechenmaschine/carma-ballista-bench.git
 cd carma-ballista-bench
 
-scripts/setup-node.sh    # one-time: create the /storage dirs and install build deps (rust, protoc, duckdb, kubectl helpers)
-scripts/gen-workload.sh  # generate the query set: clone Redbench, download the Redset trace, write workload.csv to $WORKLOAD_CSV
-scripts/build.sh         # build the Ballista scheduler/executor Docker images + ballista-cli from the fork, load them on the workers
-scripts/stage-data.sh    # download the IMDb/JOB CSVs, convert to Parquet, copy the tables to every worker node
-scripts/deploy.sh        # render the manifests from .env and apply the scheduler pod + executor DaemonSet
-scripts/check-cluster.sh # assert the cluster is homogeneous (every executor pinned to TASK_SLOTS cores); add --net to iperf3 the worker links
-scripts/run.sh 2000 16   # replay 2000 workload queries with 16 concurrent ballista-cli drivers; capture per-run metrics
-scripts/status.sh        # show pod placement and how many executors have registered
+scripts/setup-node.sh    # one-time: /storage dirs + build deps (rust, protoc, duckdb, kubectl helpers)
+scripts/gen-workload.sh  # generate the query set (clone Redbench, download Redset trace, write workload.csv)
+scripts/build.sh         # build scheduler/executor images + ballista-cli from the fork; load on workers
 ```
 
+Then pick an experiment.
+
+**local-scan** (replicated data, node-local scans):
+
+```sh
+experiments/local-scan/stage.sh        # download IMDb, convert to Parquet, rsync to every worker
+experiments/local-scan/deploy.sh       # render manifests + apply scheduler pod + executor DaemonSet
+experiments/local-scan/run.sh 2000 16  # replay 2000 queries with 16 concurrent drivers
+experiments/local-scan/sweep.sh        # full K x rep grid sweep
+```
+
+The legacy top-level shims (`scripts/stage-data.sh`, `scripts/deploy.sh`,
+`scripts/run.sh`, `scripts/grid-sweep.sh`) still work and map to `local-scan`.
+
+**s3-central** (centralized MinIO, remote scans):
+
+```sh
+experiments/s3-central/stage.sh        # convert Parquet, bring up MinIO, upload tables to the bucket (once)
+experiments/s3-central/deploy.sh       # scheduler + executors with AWS_* env + MinIO; no data hostPath
+experiments/s3-central/run.sh 2000 16
+experiments/s3-central/sweep.sh
+```
+
+No image rebuild is needed: the fork's scheduler and executor already ship the S3
+object store (`AmazonS3Builder::from_env()`); `experiment.env` supplies the
+`AWS_*` env that points it at MinIO.
+
+To cap storage bandwidth, set `MINIO_EGRESS_BW` (e.g. `1G`) in
+`experiments/s3-central/experiment.env` — `deploy.sh` applies it as a
+`kubernetes.io/egress-bandwidth` annotation on the MinIO pod (requires the CNI
+`bandwidth` plugin). Empty = unshaped.
+
+`check-cluster.sh` (homogeneity assert, `--net` for iperf3) and `status.sh` (pod
+placement / registered executors) are shared and unchanged.
+
 Notes: `gen-workload.sh` is heavy (downloads a ~18 GB Redset trace) and only
-needed once - skip it if `$WORKLOAD_CSV` already exists. `build.sh` clones the
-Ballista fork (`BALLISTA_REPO`/`BALLISTA_REF` in `.env`); node roles are
-auto-derived from the cluster.
+needed once — skip if `$WORKLOAD_CSV` exists. `build.sh` clones the Ballista fork
+(`BALLISTA_REPO`/`BALLISTA_REF` in `.env`); node roles are auto-derived.
 
 ## Layout
 
 ```
-.env        config: paths, image tag, fork repo/ref (nodes auto-derived)
-bin/        CSV->Parquet + CSV->SQL helpers
-manifests/  scheduler + executor, rendered from .env
-scripts/    setup-node, build, stage-data, deploy, check-cluster, run, status
+.env                 global config: paths, image tag, fork repo/ref (nodes auto-derived)
+bin/                 CSV->Parquet + CSV->SQL helpers (gen_sql.py: --location-prefix selects local vs s3://)
+manifests/           base namespace + scheduler/executor (local-scan)
+scripts/             shared setup/build/gen-workload/check-cluster/status + legacy shims
+scripts/lib/         deploy-core / run-core / sweep-core + common.sh (experiment-agnostic logic)
+experiments/
+  local-scan/        experiment.env + stage.sh + thin deploy/run/sweep wrappers
+  s3-central/        experiment.env + stage.sh + wrappers + manifests/ (s3 scheduler/executor + minio)
 ```
 
 ## Runs
 
 `run.sh [queries] [concurrency] [name]` writes a fresh `runs/<name>-<timestamp>/`
-(`setup.sql`, `workload*.sql`, `stages.jsonl`, `cli*.log`, `meta.txt`). The
+(`setup.sql`, `workload*.sql`, `stages.jsonl`, `cli*.log`, `meta.txt`,
+`config.txt`, `experiment.env.snapshot`). `meta.txt`/`config.txt` record the
+`storage` mode (and `minio_egress_bw`), so every run is self-describing. The
 timestamp suffix means reusing a name never collides or overwrites.

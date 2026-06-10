@@ -19,19 +19,25 @@ def truthy(v):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--workload", required=True)
-    p.add_argument("--data-dir", required=True)
+    p.add_argument("--data-dir", required=True, help="local Parquet dir (source of table names)")
+    p.add_argument("--location-prefix", default=None,
+                   help="LOCATION prefix for each table (default: --data-dir). "
+                        "e.g. s3://carma-imdb/imdb for remote storage")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--limit", type=int, default=0, help="0 = all")
     a = p.parse_args()
     qdir = os.path.join(a.out_dir, "queries")
     os.makedirs(qdir, exist_ok=True)
 
+    # Table names always come from the local Parquet dir; the LOCATION written
+    # into setup.sql may point elsewhere (a remote s3:// store) via --location-prefix.
+    prefix = (a.location_prefix or a.data_dir).rstrip("/")
     tables = sorted(d for d in os.listdir(a.data_dir)
                     if os.path.isdir(os.path.join(a.data_dir, d)) and not d.startswith("."))
     with open(os.path.join(a.out_dir, "setup.sql"), "w") as f:
         for t in tables:
             f.write(f"CREATE EXTERNAL TABLE {t} STORED AS PARQUET "
-                    f"LOCATION '{os.path.join(a.data_dir, t)}';\n")
+                    f"LOCATION '{prefix}/{t}';\n")
 
     n = 0
     with open(a.workload, newline="") as f:
